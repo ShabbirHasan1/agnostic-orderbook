@@ -4,6 +4,7 @@ use bonfida_utils::{
     {BorshSize, InstructionsAccount},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
+use bytemuck::Pod;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -13,7 +14,7 @@ use solana_program::{
 };
 
 use crate::{
-    critbit::Slab,
+    critbit::{Slab, SlabRef},
     error::AoError,
     state::{AccountTag, EventQueue, EventQueueHeader, MarketState},
     utils::{check_account_owner, check_unitialized},
@@ -87,7 +88,7 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
 }
 
 /// Apply the create_market instruction to the provided accounts
-pub fn process<'a, 'b: 'a>(
+pub fn process<'a, 'b: 'a, C: Pod>(
     program_id: &Pubkey,
     accounts: Accounts<'a, AccountInfo<'b>>,
     params: Params,
@@ -134,12 +135,11 @@ pub fn process<'a, 'b: 'a>(
         .serialize(&mut (&mut accounts.event_queue.data.borrow_mut() as &mut [u8]))
         .unwrap();
 
-    Slab::initialize(
-        &mut accounts.bids.data.borrow_mut(),
+    SlabRef::<C>::initialize(
         &mut accounts.asks.data.borrow_mut(),
+        &mut accounts.bids.data.borrow_mut(),
         *accounts.market.key,
-        callback_info_len as usize,
-    );
+    )?;
 
     Ok(())
 }

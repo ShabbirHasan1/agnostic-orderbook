@@ -63,13 +63,7 @@ pub fn get_spread<'ob>(
     asks_account: &AccountInfo<'ob>,
 ) -> (Option<u64>, Option<u64>) {
     let market_state = MarketState::get(market_state_account).unwrap();
-    let orderbook = OrderBookState::new_safe(
-        bids_account,
-        asks_account,
-        market_state.callback_info_len as usize,
-        market_state.callback_id_len as usize,
-    )
-    .unwrap();
+    let orderbook = OrderBookState::new_safe(bids_account, asks_account).unwrap();
     orderbook.get_spread()
 }
 

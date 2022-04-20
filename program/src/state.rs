@@ -129,11 +129,37 @@ impl MarketState {
     }
 }
 
+#[derive(Zeroable, Clone, Pod, Copy)]
+#[repr(C)]
+pub struct FillEvent {
+    /// The order id of the maker order
+    maker_order_id: u128,
+    /// The total quote size of the transaction
+    quote_size: u64,
+    /// The total base size of the transaction
+    base_size: u64,
+    #[allow(missing_docs)]
+    taker_side: u8,
+}
+
+#[derive(Zeroable, Clone, Pod, Copy)]
+#[repr(C)]
+pub struct OutEvent {
+    /// The order id of the maker order
+    order_id: u128,
+    /// The total base size of the transaction
+    base_size: u64,
+    /// The total quote size of the transaction
+    delete: u8,
+    #[allow(missing_docs)]
+    side: u8,
+}
+
 ////////////////////////////////////////////////////
 // Events
 #[derive(BorshDeserialize, BorshSerialize, Debug)]
 /// Events are the primary output of the asset agnostic orderbook
-pub enum Event {
+pub enum Event<C> {
     /// A fill event describes a match between a taker order and a provider order
     Fill {
         #[allow(missing_docs)]
@@ -145,9 +171,9 @@ pub enum Event {
         /// The total base size of the transaction
         base_size: u64,
         /// The callback information for the maker
-        maker_callback_info: Vec<u8>,
+        maker_callback_info: C,
         /// The callback information for the taker
-        taker_callback_info: Vec<u8>,
+        taker_callback_info: C,
     },
     /// An out event describes an order which has been taken out of the orderbook
     Out {
@@ -160,11 +186,11 @@ pub enum Event {
         #[allow(missing_docs)]
         delete: bool,
         #[allow(missing_docs)]
-        callback_info: Vec<u8>,
+        callback_info: C,
     },
 }
 
-impl Event {
+impl<C: Pod> Event<C> {
     /// Used to serialize an event object into a generic byte writer.
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), IoError> {
         match self {
@@ -181,8 +207,8 @@ impl Event {
                 writer.write_all(&maker_order_id.to_le_bytes())?;
                 writer.write_all(&quote_size.to_le_bytes())?;
                 writer.write_all(&base_size.to_le_bytes())?;
-                writer.write_all(maker_callback_info)?;
-                writer.write_all(taker_callback_info)?;
+                writer.write_all(bytemuck::bytes_of(maker_callback_info))?;
+                writer.write_all(bytemuck::bytes_of(taker_callback_info))?;
             }
             Event::Out {
                 side,
@@ -196,7 +222,7 @@ impl Event {
                 writer.write_all(&order_id.to_le_bytes())?;
                 writer.write_all(&base_size.to_le_bytes())?;
                 writer.write_all(&[(*delete as u8)])?;
-                writer.write_all(callback_info)?;
+                writer.write_all(bytemuck::bytes_of(callback_info))?;
             }
         };
         Ok(())
@@ -204,22 +230,24 @@ impl Event {
 
     /// Used to deserialize an event object from bytes.
     pub fn deserialize(buf: &mut &[u8], callback_info_len: usize) -> Self {
+        let callback_info_len = std::mem::size_of::<C>();
         match buf[0] {
             0 => Event::Fill {
                 taker_side: Side::from_u8(buf[1]).unwrap(),
                 maker_order_id: u128::from_le_bytes(buf[2..18].try_into().unwrap()),
                 quote_size: u64::from_le_bytes(buf[18..26].try_into().unwrap()),
                 base_size: u64::from_le_bytes(buf[26..34].try_into().unwrap()),
-                maker_callback_info: buf[34..34 + callback_info_len].to_owned(),
-                taker_callback_info: buf[34 + callback_info_len..34 + (callback_info_len << 1)]
-                    .to_owned(),
+                maker_callback_info: *bytemuck::from_bytes(&buf[34..34 + callback_info_len]),
+                taker_callback_info: *bytemuck::from_bytes(
+                    &buf[34 + callback_info_len..34 + (callback_info_len << 1)],
+                ),
             },
             1 => Event::Out {
                 side: Side::from_u8(buf[1]).unwrap(),
                 order_id: u128::from_le_bytes(buf[2..18].try_into().unwrap()),
                 base_size: u64::from_le_bytes(buf[18..26].try_into().unwrap()),
                 delete: buf[26] == 1,
-                callback_info: buf[27..27 + callback_info_len].to_owned(),
+                callback_info: *bytemuck::from_bytes(&buf[27..27 + callback_info_len]),
             },
             _ => unreachable!(),
         }
@@ -274,17 +302,17 @@ impl EventQueueHeader {
 /// and a circular buffer of serialized events.
 ///
 /// This struct is used at runtime but doesn't represent a serialized event queue
-pub struct EventQueue<'a> {
+pub struct EventQueue<'a, C> {
     #[doc(hidden)]
     pub header: EventQueueHeader,
     pub(crate) buffer: Rc<RefCell<&'a mut [u8]>>, //The whole account data
-    callback_info_len: usize,
+    _marker: std::marker::PhantomData<C>,
 }
 
 /// The event queue register can hold arbitrary data returned by the AAOB. Currently only used to return [`OrderSummary`] objects.
 pub type Register<T> = Option<T>;
 
-impl<'a> EventQueue<'a> {
+impl<'a, C> EventQueue<'a, C> {
     pub(crate) fn new_safe(
         header: EventQueueHeader,
         account: &AccountInfo<'a>,
@@ -293,7 +321,7 @@ impl<'a> EventQueue<'a> {
         let q = Self {
             header: header.check()?,
             buffer: Rc::clone(&account.data),
-            callback_info_len,
+            _marker: Default::default(),
         };
         q.clear_register();
         Ok(q)
@@ -318,7 +346,7 @@ impl<'a> EventQueue<'a> {
         Self {
             header,
             buffer: account,
-            callback_info_len,
+            _marker: Default::default(),
         }
     }
 
@@ -331,7 +359,7 @@ impl<'a> EventQueue<'a> {
         Self {
             header,
             buffer: Rc::new(RefCell::new(buffer)),
-            callback_info_len,
+            _marker: Default::default(),
         }
     }
 
@@ -345,7 +373,7 @@ impl<'a> EventQueue<'a> {
     }
 }
 
-impl<'a> EventQueue<'a> {
+impl<'a, C> EventQueue<'a, C> {
     pub(crate) fn check_buffer_size(
         account: &AccountInfo,
         callback_info_len: u64,
@@ -382,7 +410,7 @@ impl<'a> EventQueue<'a> {
         self.header.count as usize == (self.get_buf_len() / (self.header.event_size as usize))
     }
 
-    pub(crate) fn push_back(&mut self, event: Event) -> Result<(), Event> {
+    pub(crate) fn push_back(&mut self, event: Event<C>) -> Result<(), Event<C>> {
         if self.full() {
             return Err(event);
         }
@@ -401,7 +429,7 @@ impl<'a> EventQueue<'a> {
     }
 
     /// Retrieves the event at position index in the queue.
-    pub fn peek_at(&self, index: u64) -> Option<Event> {
+    pub fn peek_at(&self, index: u64) -> Option<Event<C>> {
         if self.header.count <= index {
             return None;
         }
@@ -455,7 +483,7 @@ impl<'a> EventQueue<'a> {
 
     /// Returns an iterator over all the queue's events
     #[cfg(feature = "no-entrypoint")]
-    pub fn iter<'b>(&'b self) -> QueueIterator<'a, 'b> {
+    pub fn iter<'b>(&'b self) -> QueueIterator<'a, 'b, C> {
         QueueIterator {
             queue_header: &self.header,
             buffer: Rc::clone(&self.buffer),
@@ -481,10 +509,10 @@ pub fn read_register<T: BorshSerialize + BorshDeserialize>(
 }
 
 #[cfg(feature = "no-entrypoint")]
-impl<'a, 'b> IntoIterator for &'b EventQueue<'a> {
-    type Item = Event;
+impl<'a, 'b, C> IntoIterator for &'b EventQueue<'a, C> {
+    type Item = Event<C>;
 
-    type IntoIter = QueueIterator<'a, 'b>;
+    type IntoIter = QueueIterator<'a, 'b, C>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -492,7 +520,7 @@ impl<'a, 'b> IntoIterator for &'b EventQueue<'a> {
 }
 #[cfg(feature = "no-entrypoint")]
 /// Utility struct for iterating over a queue
-pub struct QueueIterator<'a, 'b> {
+pub struct QueueIterator<'a, 'b, C> {
     queue_header: &'b EventQueueHeader,
     buffer: Rc<RefCell<&'a mut [u8]>>, //The whole account data
     current_index: usize,
@@ -500,11 +528,12 @@ pub struct QueueIterator<'a, 'b> {
     buffer_length: usize,
     header_offset: usize,
     remaining: u64,
+    _marker: std::marker::PhantomData<C>,
 }
 
 #[cfg(feature = "no-entrypoint")]
-impl<'a, 'b> Iterator for QueueIterator<'a, 'b> {
-    type Item = Event;
+impl<'a, 'b, C> Iterator for QueueIterator<'a, 'b, C> {
+    type Item = Event<C>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {

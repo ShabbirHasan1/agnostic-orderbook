@@ -18,7 +18,8 @@ pub fn process_instruction(
     instruction_data: &[u8],
 ) -> ProgramResult {
     msg!("Entrypoint");
-    if let Err(error) = Processor::process_instruction(program_id, accounts, instruction_data) {
+    if let Err(error) = Processor::process_instruction::<()>(program_id, accounts, instruction_data)
+    {
         // catch the error so we can print it
         error.print::<AoError>();
         return Err(error);

@@ -2,6 +2,7 @@
 
 use bonfida_utils::{BorshSize, InstructionsAccount};
 use borsh::{BorshDeserialize, BorshSerialize};
+use bytemuck::Pod;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -23,7 +24,7 @@ use crate::{
 /**
 The required arguments for a new_order instruction.
 */
-pub struct Params {
+pub struct Params<C> {
     /// The maximum quantity of base to be traded.
     pub max_base_qty: u64,
     /// The maximum quantity of quote to be traded.
@@ -40,8 +41,8 @@ pub struct Params {
     pub match_limit: u64,
     /// The callback information is used to attach metadata to an order. This callback information will be transmitted back through the event queue.
     ///
-    /// The size of this vector should be equal to the current market's [`callback_info_len`][`MarketState::callback_info_len`].
-    pub callback_info: Vec<u8>,
+    /// The size of this vector should not exceed the current market's [`callback_info_len`][`MarketState::callback_info_len`].
+    pub callback_info: C,
     /// The order will not be matched against the orderbook and will be direcly written into it.
     ///
     /// The operation will fail if the order's limit_price crosses the spread.
@@ -110,10 +111,10 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
 }
 
 /// Apply the new_order instruction to the provided accounts
-pub fn process<'a, 'b: 'a>(
+pub fn process<'a, 'b: 'a, C: Pod>(
     program_id: &Pubkey,
     accounts: Accounts<'a, AccountInfo<'b>>,
-    params: Params,
+    params: Params<C>,
 ) -> ProgramResult {
     accounts.perform_checks(program_id)?;
     let mut market_state = MarketState::get(accounts.market)?;
@@ -126,12 +127,7 @@ pub fn process<'a, 'b: 'a>(
 
     let callback_info_len = market_state.callback_info_len as usize;
 
-    let mut order_book = OrderBookState::new_safe(
-        accounts.bids,
-        accounts.asks,
-        market_state.callback_info_len as usize,
-        market_state.callback_id_len as usize,
-    )?;
+    let mut order_book = OrderBookState::new_safe(accounts.bids, accounts.asks)?;
 
     if params.callback_info.len() != callback_info_len {
         msg!("Invalid callback information");
@@ -157,7 +153,6 @@ pub fn process<'a, 'b: 'a>(
         .header
         .serialize(&mut event_queue_header_data)
         .unwrap();
-    order_book.commit_changes();
 
     //Verify that fees were transfered. Fees are expected to be transfered by the caller program in order
     // to reduce the CPI call stack depth.
