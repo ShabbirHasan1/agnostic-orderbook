@@ -1,7 +1,8 @@
 //! Cancel a series of existing orders in the orderbook.
 
-use bonfida_utils::{BorshSize, InstructionsAccount};
+use bonfida_utils::{fp_math::fp32_mul, BorshSize, InstructionsAccount};
 use borsh::{BorshDeserialize, BorshSerialize};
+use bytemuck::Pod;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -11,11 +12,13 @@ use solana_program::{
 
 use crate::{
     error::AoError,
-    orderbook::{OrderBookState, OrderSummary},
     state::{
-        get_side_from_order_id, EventQueue, EventQueueHeader, MarketState, EVENT_QUEUE_HEADER_LEN,
+        get_side_from_order_id,
+        market_state::MarketState,
+        orderbook::{CallbackInfo, OrderBookState, OrderSummary},
+        AccountTag,
     },
-    utils::{check_account_key, check_account_owner, check_signer, fp32_mul},
+    utils::{check_account_key, check_account_owner, check_signer},
 };
 #[derive(BorshDeserialize, BorshSerialize, Clone, BorshSize)]
 /**
@@ -61,7 +64,6 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         };
         Ok(a)
     }
-
     /// Perform basic security checks on the accounts
     pub(crate) fn perform_checks(&self, program_id: &Pubkey) -> Result<(), ProgramError> {
         check_account_owner(
@@ -82,26 +84,24 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
     }
 }
 /// Apply the cancel_order instruction to the provided accounts
-pub fn process<'a, 'b: 'a>(
+pub fn process<'a, 'b: 'a, C: CallbackInfo + Pod + PartialEq>(
     program_id: &Pubkey,
     accounts: Accounts<'a, AccountInfo<'b>>,
     params: Params,
-) -> ProgramResult {
+) -> Result<OrderSummary, ProgramError>
+where
+    <C as CallbackInfo>::CallbackId: PartialEq,
+{
     accounts.perform_checks(program_id)?;
-    let market_state = MarketState::get(accounts.market)?;
+    let mut market_data = accounts.market.data.borrow_mut();
+    let market_state = MarketState::from_buffer(&mut market_data, AccountTag::Market)?;
 
-    check_accounts(&accounts, &market_state)?;
+    check_accounts(&accounts, market_state)?;
 
-    let callback_info_len = market_state.callback_info_len as usize;
+    let mut bids_guard = accounts.bids.data.borrow_mut();
+    let mut asks_guard = accounts.asks.data.borrow_mut();
 
-    let mut order_book = OrderBookState::new_safe(accounts.bids, accounts.asks)?;
-
-    let header = {
-        let mut event_queue_data: &[u8] =
-            &accounts.event_queue.data.borrow()[0..EVENT_QUEUE_HEADER_LEN];
-        EventQueueHeader::deserialize(&mut event_queue_data).unwrap()
-    };
-    let event_queue = EventQueue::new_safe(header, accounts.event_queue, callback_info_len)?;
+    let mut order_book = OrderBookState::<C>::new_safe(&mut bids_guard, &mut asks_guard)?;
 
     let mut total_base_qty = 0;
     let mut total_quote_qty = 0;
@@ -110,7 +110,7 @@ pub fn process<'a, 'b: 'a>(
         let slab = order_book.get_tree(get_side_from_order_id(order_id));
         let (leaf_node, _) = slab.remove_by_key(order_id).ok_or(AoError::OrderNotFound)?;
         total_base_qty += leaf_node.base_quantity;
-        total_quote_qty += fp32_mul(leaf_node.base_quantity, leaf_node.price());
+        total_quote_qty += fp32_mul(leaf_node.base_quantity, leaf_node.price()).unwrap();
     }
 
     let order_summary = OrderSummary {
@@ -120,9 +120,7 @@ pub fn process<'a, 'b: 'a>(
         total_base_qty_posted: 0,
     };
 
-    event_queue.write_to_register(order_summary);
-
-    Ok(())
+    Ok(order_summary)
 }
 
 fn check_accounts<'a, 'b: 'a>(
@@ -136,12 +134,6 @@ fn check_accounts<'a, 'b: 'a>(
     )?;
     check_account_key(accounts.bids, &market_state.bids, AoError::WrongBidsAccount)?;
     check_account_key(accounts.asks, &market_state.asks, AoError::WrongAsksAccount)?;
-    #[cfg(not(feature = "lib"))]
-    check_account_key(
-        accounts.authority,
-        &market_state.caller_authority,
-        AoError::WrongCallerAuthority,
-    )?;
 
     Ok(())
 }

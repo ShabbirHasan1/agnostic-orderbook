@@ -2,12 +2,9 @@
 use crate::error::AoError;
 use crate::state::AccountTag;
 use borsh::{BorshDeserialize, BorshSerialize};
-use bytemuck::{from_bytes, Pod, Zeroable};
-use solana_program::msg;
+use bytemuck::{Pod, Zeroable};
 use solana_program::program_error::ProgramError;
 use solana_program::pubkey::Pubkey;
-use std::cell::RefMut;
-use std::ops::DerefMut;
 // A Slab contains the data for a slab header and an array of nodes of a critbit tree
 // whose leafs contain the data referencing an order of the orderbook.
 
@@ -37,12 +34,11 @@ impl SlabHeader {
     pub const LEN: usize = std::mem::size_of::<Self>();
 }
 
-pub struct Slab<H, L, I, C> {
-    pub header: H,
-    pub leaf_nodes: L,
-    pub inner_nodes: I,
-    pub callback_infos: C,
-    pub callback_info_len: usize,
+pub struct Slab<'a, C> {
+    pub header: &'a mut SlabHeader,
+    pub leaf_nodes: &'a mut [LeafNode],
+    pub inner_nodes: &'a mut [InnerNode],
+    pub callback_infos: &'a mut [C],
 }
 #[derive(Zeroable, Clone, Copy, Pod, Debug, PartialEq)]
 #[repr(C)]
@@ -73,8 +69,8 @@ pub const INNER_FLAG: u32 = 1 << 31;
 #[derive(Zeroable, Clone, Copy, Pod, Debug)]
 #[repr(C)]
 pub struct InnerNode {
-    prefix_len: u64,
     key: u128,
+    prefix_len: u64,
     pub children: [u32; 2],
 }
 
@@ -87,11 +83,6 @@ impl InnerNode {
         (self.children[crit_bit as usize], crit_bit)
     }
 }
-
-pub type SlabRef<'a, C> =
-    Slab<RefMut<'a, SlabHeader>, RefMut<'a, [LeafNode]>, RefMut<'a, [InnerNode]>, RefMut<'a, [C]>>;
-
-pub type SlabHeaped<C> = Slab<Box<SlabHeader>, Box<[LeafNode]>, Box<[InnerNode]>, Box<[C]>>;
 
 pub enum Node {
     Leaf,
@@ -108,55 +99,7 @@ impl Node {
     }
 }
 
-trait CallbackInfo: Sized {
-    fn from_bytes(data: &[u8]) -> Self;
-}
-
-impl CallbackInfo for Pubkey {
-    fn from_bytes(data: &[u8]) -> Self {
-        Self::new(data)
-    }
-}
-
-impl<'slab, C: Pod> SlabRef<'slab, C> {
-    pub fn get<'b: 'slab>(
-        account_data: RefMut<'slab, &'b mut [u8]>,
-        expected_tag: AccountTag,
-    ) -> Result<Self, ProgramError> {
-        let callback_info_len = std::mem::size_of::<C>();
-        let leaf_size = LeafNode::LEN + callback_info_len;
-        let capacity =
-            (account_data.len() - SlabHeader::LEN - 8 - leaf_size) / (leaf_size + InnerNode::LEN);
-
-        let account_tag: &u64 = from_bytes(&account_data[0..8]);
-
-        if !account_tag != expected_tag as u64 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let (header, remaining) = RefMut::map_split(account_data, |s| {
-            let (hd, rm) = s[8..].split_at_mut(SlabHeader::LEN);
-            (bytemuck::from_bytes_mut::<SlabHeader>(hd), rm)
-        });
-        let (leaf_nodes, remaining) = RefMut::map_split(remaining, |s| {
-            let (leaves, remaining) = s.split_at_mut((capacity + 1) * LeafNode::LEN);
-            (bytemuck::cast_slice_mut::<_, LeafNode>(leaves), remaining)
-        });
-        let (inner_nodes, remaining) = RefMut::map_split(remaining, |s| {
-            let (inner_nodes, remaining) = s.split_at_mut(capacity * InnerNode::LEN);
-            (
-                bytemuck::cast_slice_mut::<_, InnerNode>(inner_nodes),
-                bytemuck::cast_slice_mut::<_, C>(remaining),
-            )
-        });
-        Ok(Self {
-            header,
-            leaf_nodes,
-            inner_nodes,
-            callback_infos: remaining,
-            callback_info_len,
-        })
-    }
-
+impl<'slab, C> Slab<'slab, C> {
     pub fn initialize(
         asks_data: &mut [u8],
         bids_data: &mut [u8],
@@ -179,20 +122,16 @@ impl<'slab, C: Pod> SlabRef<'slab, C> {
         Ok(())
     }
 
-    pub fn compute_allocation_size(
-        desired_order_capacity: usize,
-        callback_info_len: usize,
-    ) -> usize {
+    pub fn compute_allocation_size(desired_order_capacity: usize) -> usize {
         8 + SlabHeader::LEN
             + LeafNode::LEN
-            + callback_info_len
-            + desired_order_capacity * (LeafNode::LEN + InnerNode::LEN + callback_info_len)
+            + std::mem::size_of::<C>()
+            + desired_order_capacity * (LeafNode::LEN + InnerNode::LEN + std::mem::size_of::<C>())
     }
 }
 
-#[cfg(not(target = "bpf"))]
-impl<C: Pod> SlabHeaped<C> {
-    pub fn from_buffer(mut buf: &[u8], expected_tag: AccountTag) -> Result<Self, ProgramError> {
+impl<'a, C: Pod> Slab<'a, C> {
+    pub fn from_buffer(buf: &'a mut [u8], expected_tag: AccountTag) -> Result<Self, ProgramError> {
         let callback_info_len = std::mem::size_of::<C>();
         let leaf_size = LeafNode::LEN + callback_info_len;
         let capacity = (buf.len() - SlabHeader::LEN - 8 - leaf_size) / (leaf_size + InnerNode::LEN);
@@ -200,30 +139,22 @@ impl<C: Pod> SlabHeaped<C> {
         if buf[0] != expected_tag as u8 {
             return Err(ProgramError::InvalidAccountData);
         }
-
-        buf = &buf[8..];
-        let (header, rem) = buf.split_at(SlabHeader::LEN);
-        let (leaves, rem) = rem.split_at((capacity + 1) * LeafNode::LEN);
-        let (inner_nodes, callback_infos) = rem.split_at(capacity * InnerNode::LEN);
-        let header = bytemuck::from_bytes::<SlabHeader>(header);
+        let (_, rem) = buf.split_at_mut(8);
+        let (header, rem) = rem.split_at_mut(SlabHeader::LEN);
+        let (leaves, rem) = rem.split_at_mut((capacity + 1) * LeafNode::LEN);
+        let (inner_nodes, callback_infos) = rem.split_at_mut(capacity * InnerNode::LEN);
+        let header = bytemuck::from_bytes_mut::<SlabHeader>(header);
 
         Ok(Self {
-            header: Box::new(*header),
-            leaf_nodes: Box::from(bytemuck::cast_slice::<_, LeafNode>(leaves)),
-            inner_nodes: Box::from(bytemuck::cast_slice::<_, InnerNode>(inner_nodes)),
-            callback_infos: Box::from(bytemuck::cast_slice::<_, C>(callback_infos)),
-            callback_info_len,
+            header,
+            leaf_nodes: bytemuck::cast_slice_mut::<_, LeafNode>(leaves),
+            inner_nodes: bytemuck::cast_slice_mut::<_, InnerNode>(inner_nodes),
+            callback_infos: bytemuck::cast_slice_mut::<_, C>(callback_infos),
         })
     }
 }
 
-impl<
-        H: DerefMut<Target = SlabHeader>,
-        L: DerefMut<Target = [LeafNode]>,
-        I: DerefMut<Target = [InnerNode]>,
-        C: DerefMut<Target = [u8]>,
-    > Slab<H, L, I, C>
-{
+impl<'a, C> Slab<'a, C> {
     pub fn root(&self) -> Option<NodeHandle> {
         if self.header.leaf_count == 0 {
             None
@@ -366,17 +297,17 @@ impl<
         }
     }
 
-    pub fn get_callback_info(&self, leaf_handle: NodeHandle) -> &[u8] {
-        let offset = (leaf_handle as usize) * self.callback_info_len;
-        &self.callback_infos[offset..offset + self.callback_info_len]
+    #[inline(always)]
+    pub fn get_callback_info(&self, leaf_handle: NodeHandle) -> &C {
+        &self.callback_infos[leaf_handle as usize]
     }
 
-    pub fn get_callback_info_mut(&mut self, leaf_handle: NodeHandle) -> &mut [u8] {
-        let offset = (leaf_handle as usize) * self.callback_info_len;
-        &mut self.callback_infos[offset..offset + self.callback_info_len]
+    #[inline(always)]
+    pub fn get_callback_info_mut(&mut self, leaf_handle: NodeHandle) -> &mut C {
+        &mut self.callback_infos[leaf_handle as usize]
     }
 
-    pub fn remove_by_key(&mut self, search_key: u128) -> Option<(LeafNode, Vec<u8>)> {
+    pub fn remove_by_key(&mut self, search_key: u128) -> Option<(LeafNode, &C)> {
         let mut grandparent_h: Option<NodeHandle> = None;
         if self.header.leaf_count == 0 {
             return None;
@@ -387,7 +318,7 @@ impl<
         let mut crit_bit = false;
         let mut prev_crit_bit: Option<bool> = None;
         let mut remove_root = None;
-        let mut depth = 0;
+        // let mut depth = 0;
         {
             match Node::from_handle(parent_h) {
                 Node::Leaf => {
@@ -405,12 +336,11 @@ impl<
             }
         }
         if let Some(leaf_copy) = remove_root {
-            let callback_info = self.get_callback_info(parent_h).to_vec();
             self.free_leaf(parent_h);
 
             self.header.root_node = 0;
             self.header.leaf_count = 0;
-            return Some((leaf_copy, callback_info));
+            return Some((leaf_copy, self.get_callback_info(parent_h)));
         }
         loop {
             match Node::from_handle(child_h) {
@@ -422,7 +352,7 @@ impl<
                     child_h = grandchild_h;
                     prev_crit_bit = Some(crit_bit);
                     crit_bit = grandchild_crit_bit;
-                    depth += 1;
+                    // depth += 1;
                     continue;
                 }
                 Node::Leaf => {
@@ -435,7 +365,7 @@ impl<
                 }
             }
         }
-        msg!("Found key at depth : {}", depth);
+        // msg!("Found key at depth : {}", depth);
         // replace parent with its remaining child node
         // free child_h, replace *parent_h with *other_child_h, free other_child_h
         let other_child_h = self.inner_nodes[(!parent_h) as usize].children[!crit_bit as usize];
@@ -450,10 +380,9 @@ impl<
         }
         self.header.leaf_count -= 1;
         let removed_leaf = self.leaf_nodes[child_h as usize];
-        let callback_info = self.get_callback_info(child_h).to_vec();
         self.free_leaf(child_h);
         self.free_inner_node(parent_h);
-        Some((removed_leaf, callback_info))
+        Some((removed_leaf, self.get_callback_info(child_h)))
     }
 
     fn find_min_max(&self, find_max: bool) -> Option<NodeHandle> {
@@ -482,18 +411,18 @@ impl<
         self.find_min_max(true)
     }
 
-    pub(crate) fn remove_min(&mut self) -> Option<(LeafNode, Vec<u8>)> {
+    pub(crate) fn remove_min(&mut self) -> Option<(LeafNode, &C)> {
         let key = self.leaf_nodes[self.find_min()? as usize].key;
         self.remove_by_key(key)
     }
 
-    pub(crate) fn remove_max(&mut self) -> Option<(LeafNode, Vec<u8>)> {
+    pub(crate) fn remove_max(&mut self) -> Option<(LeafNode, &C)> {
         let key = self.leaf_nodes[self.find_max()? as usize].key;
         self.remove_by_key(key)
     }
 
     /// Get a price ascending or price descending iterator over all the Slab's orders
-    pub fn into_iter(self, price_ascending: bool) -> impl Iterator<Item = LeafNode> {
+    pub fn into_iter(self, price_ascending: bool) -> SlabIterator<'a, C> {
         SlabIterator {
             search_stack: if self.header.leaf_count == 0 {
                 vec![]
@@ -505,66 +434,29 @@ impl<
         }
     }
 
-    // #[cfg(feature = "utils")]
-    // pub fn get_depth(&self) -> usize {
-    //     if self.header.leaf_count == 0 {
-    //         return 0;
-    //     }
-    //     let mut stack = vec![(self.header.root_node, 1)];
-    //     let mut max_depth = 0;
-    //     while let Some((current_node, current_depth)) = stack.pop() {
-    //         match Node::from_handle(current_node) {
-    //             Node::Inner => {
-    //                 let node = self.inner_nodes[(!current_node) as usize];
-    //                 stack.push((node.children[0], current_depth + 1));
-    //                 stack.push((node.children[1], current_depth + 1));
-    //             }
-    //             Node::Leaf => max_depth = std::cmp::max(current_depth, max_depth),
-    //         }
-    //     }
-    //     max_depth
-    // }
-
-    #[cfg(test)]
-    fn traverse<T: CallbackInfo>(&self) -> Vec<(LeafNode, T)> {
-        fn walk_rec<
-            S: CallbackInfo,
-            H: DerefMut<Target = SlabHeader>,
-            L: DerefMut<Target = [LeafNode]>,
-            I: DerefMut<Target = [InnerNode]>,
-            C: DerefMut<Target = [u8]>,
-        >(
-            slab: &Slab<H, L, I, C>,
-            sub_root: NodeHandle,
-            buf: &mut Vec<(LeafNode, S)>,
-        ) {
-            match Node::from_handle(sub_root) {
-                Node::Leaf => {
-                    let callback_info = S::from_bytes(slab.get_callback_info(sub_root));
-                    buf.push((slab.leaf_nodes[sub_root as usize], callback_info));
-                }
+    #[cfg(feature = "utils")]
+    pub fn get_depth(&self) -> usize {
+        if self.header.leaf_count == 0 {
+            return 0;
+        }
+        let mut stack = vec![(self.header.root_node, 1)];
+        let mut max_depth = 0;
+        while let Some((current_node, current_depth)) = stack.pop() {
+            match Node::from_handle(current_node) {
                 Node::Inner => {
-                    let n = slab.inner_nodes[(!sub_root) as usize];
-                    walk_rec(slab, n.children[0], buf);
-                    walk_rec(slab, n.children[1], buf);
+                    let node = self.inner_nodes[(!current_node) as usize];
+                    stack.push((node.children[0], current_depth + 1));
+                    stack.push((node.children[1], current_depth + 1));
                 }
+                Node::Leaf => max_depth = std::cmp::max(current_depth, max_depth),
             }
         }
-
-        let mut buf = Vec::with_capacity(self.header.leaf_count as usize);
-        if let Some(r) = self.root() {
-            walk_rec(self, r, &mut buf);
-        }
-        if buf.len() != buf.capacity() {
-            self.dump();
-        }
-        assert_eq!(buf.len(), buf.capacity());
-        buf
+        max_depth
     }
 
     #[cfg(test)]
     fn dump(&self) {
-        println!("Callback info length {:?}", self.callback_info_len);
+        // println!("Callback info length {:?}", self.callback_info_len);
         println!("Header (parsed):");
         let mut header_data = Vec::new();
         println!("{:?}", *self.header);
@@ -585,13 +477,8 @@ impl<
         // first check the live tree contents
         let mut leaf_count = 0;
         let mut inner_node_count = 0;
-        fn check_rec<
-            H: DerefMut<Target = SlabHeader>,
-            L: DerefMut<Target = [LeafNode]>,
-            I: DerefMut<Target = [InnerNode]>,
-            C: DerefMut<Target = [u8]>,
-        >(
-            slab: &Slab<H, L, I, C>,
+        fn check_rec<'a, C>(
+            slab: &Slab<'a, C>,
             h: NodeHandle,
             last_prefix_len: u64,
             last_prefix: u128,
@@ -710,19 +597,46 @@ impl<
     }
 }
 
-struct SlabIterator<H, L, I, C> {
-    slab: Slab<H, L, I, C>,
+impl<'queue, C: Clone> Slab<'queue, C> {
+    #[cfg(test)]
+    fn traverse(&self) -> Vec<(LeafNode, C)> {
+        fn walk_rec<'a, C: Clone>(
+            slab: &Slab<'a, C>,
+            sub_root: NodeHandle,
+            buf: &mut Vec<(LeafNode, C)>,
+        ) {
+            match Node::from_handle(sub_root) {
+                Node::Leaf => {
+                    let callback_info = slab.get_callback_info(sub_root);
+                    buf.push((slab.leaf_nodes[sub_root as usize], callback_info.clone()));
+                }
+                Node::Inner => {
+                    let n = slab.inner_nodes[(!sub_root) as usize];
+                    walk_rec::<C>(slab, n.children[0], buf);
+                    walk_rec::<C>(slab, n.children[1], buf);
+                }
+            }
+        }
+
+        let mut buf = Vec::with_capacity(self.header.leaf_count as usize);
+        if let Some(r) = self.root() {
+            walk_rec(self, r, &mut buf);
+        }
+        if buf.len() != buf.capacity() {
+            self.dump();
+        }
+        assert_eq!(buf.len(), buf.capacity());
+        buf
+    }
+}
+
+pub struct SlabIterator<'a, C> {
+    slab: Slab<'a, C>,
     search_stack: Vec<u32>,
     ascending: bool,
 }
 
-impl<
-        H: DerefMut<Target = SlabHeader>,
-        L: DerefMut<Target = [LeafNode]>,
-        I: DerefMut<Target = [InnerNode]>,
-        C: DerefMut<Target = [u8]>,
-    > Iterator for SlabIterator<H, L, I, C>
-{
+impl<'a, C: Pod> Iterator for SlabIterator<'a, C> {
     type Item = LeafNode;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -745,6 +659,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+
+    use crate::state::orderbook::CallbackInfo;
 
     use super::*;
     use rand::prelude::*;
@@ -769,14 +685,28 @@ mod tests {
     fn simulate_find_min() {
         use std::collections::BTreeMap;
 
+        #[derive(Copy, Clone, Zeroable, Pod, Debug, PartialEq)]
+        #[repr(C)]
+        struct TestCallbackInfo {
+            key: [u8; 32],
+        }
+
+        impl CallbackInfo for TestCallbackInfo {
+            type CallbackId = Self;
+
+            fn as_callback_id(&self) -> &Self::CallbackId {
+                self
+            }
+        }
+
         for trial in 0..10u64 {
-            let mut bytes = vec![0u8; 80_000];
+            let mut bytes = vec![0u8; Slab::<[u8; 32]>::compute_allocation_size(10_000)];
             bytes[0] = AccountTag::Asks as u8;
-            let mut slab = SlabHeaped::from_buffer(&bytes, AccountTag::Asks).unwrap();
+            let mut slab = Slab::from_buffer(&mut bytes, AccountTag::Asks).unwrap();
 
             slab.header.market_address = Pubkey::new_unique().to_bytes();
 
-            let mut model: BTreeMap<u128, (LeafNode, Pubkey)> = BTreeMap::new();
+            let mut model: BTreeMap<u128, (LeafNode, TestCallbackInfo)> = BTreeMap::new();
 
             let mut all_keys = vec![];
 
@@ -798,9 +728,14 @@ mod tests {
                 println!("owner : {:?}", &owner.to_bytes());
                 println!("{}", i);
                 let h = slab.insert_leaf(&leaf).unwrap().0;
-                slab.get_callback_info_mut(h)
-                    .copy_from_slice(&owner.to_bytes());
-                model.insert(key, (leaf, owner)).ok_or(()).unwrap_err();
+                let callback_info = TestCallbackInfo {
+                    key: owner.to_bytes(),
+                };
+                *slab.get_callback_info_mut(h) = callback_info;
+                model
+                    .insert(key, (leaf, callback_info))
+                    .ok_or(())
+                    .unwrap_err();
                 all_keys.push(key);
 
                 // test find_by_key
@@ -810,7 +745,7 @@ mod tests {
                 for &search_key in &[valid_search_key, invalid_search_key] {
                     let slab_value = slab.find_by_key(search_key).map(|x| {
                         let s = slab.leaf_nodes[x as usize];
-                        (s.to_owned(), Pubkey::new(slab.get_callback_info(x)))
+                        (s.to_owned(), *slab.get_callback_info(x))
                     });
                     let model_value = model.get(&search_key).cloned();
                     assert_eq!(slab_value, model_value);
@@ -820,14 +755,14 @@ mod tests {
                 let min_h = slab.find_min().unwrap();
                 let slab_min = slab.leaf_nodes[min_h as usize];
                 let model_min = model.iter().next().unwrap().1;
-                let owner = Pubkey::new(slab.get_callback_info(min_h));
+                let owner = *slab.get_callback_info(min_h);
                 assert_eq!(&(slab_min, owner), model_min);
 
                 // test find_max
                 let max_h = slab.find_max().unwrap();
                 let slab_max = slab.leaf_nodes[max_h as usize];
                 let model_max = model.iter().next_back().unwrap().1;
-                let owner = Pubkey::new(slab.get_callback_info(max_h));
+                let owner = *slab.get_callback_info(max_h);
                 assert_eq!(&(slab_max, owner), model_max);
             }
         }
@@ -838,12 +773,12 @@ mod tests {
         use rand::distributions::WeightedIndex;
         use std::collections::BTreeMap;
 
-        let mut bytes = vec![0u8; 800_000];
+        let mut bytes = vec![0u8; Slab::<[u8; 32]>::compute_allocation_size(10_000)];
         bytes[0] = AccountTag::Asks as u8;
-        let mut slab = SlabHeaped::from_buffer(&bytes, AccountTag::Asks).unwrap();
+        let mut slab = Slab::from_buffer(&mut bytes, AccountTag::Asks).unwrap();
 
         slab.header.market_address = Pubkey::new_unique().to_bytes();
-        let mut model: BTreeMap<u128, (LeafNode, Pubkey)> = BTreeMap::new();
+        let mut model: BTreeMap<u128, (LeafNode, [u8; 32])> = BTreeMap::new();
 
         let mut all_keys = vec![];
         let mut rng = StdRng::seed_from_u64(1);
@@ -881,7 +816,7 @@ mod tests {
             for i in 0..100_000 {
                 slab.check_invariants();
                 let model_state = model.values().collect::<Vec<_>>();
-                let slab_state: Vec<(LeafNode, Pubkey)> = slab.traverse();
+                let slab_state: Vec<(LeafNode, [u8; 32])> = slab.traverse();
                 assert_eq!(model_state, slab_state.iter().collect::<Vec<_>>());
                 let op = weights[dist.sample(&mut rng)].0;
                 println!("Operation : {:?}", op);
@@ -893,16 +828,15 @@ mod tests {
                             Op::InsertDup => *all_keys.choose(&mut rng).unwrap(),
                             _ => unreachable!(),
                         };
-                        let owner = Pubkey::new_unique();
+                        let owner = Pubkey::new_unique().to_bytes();
                         let qty = rng.gen();
                         let leaf = LeafNode {
                             key,
                             base_quantity: qty,
                         };
                         let (leaf_h, old_leaf) = slab.insert_leaf(&leaf).unwrap();
-                        let old_owner = Pubkey::new(slab.get_callback_info(leaf_h));
-                        slab.get_callback_info_mut(leaf_h)
-                            .copy_from_slice(&owner.to_bytes());
+                        let old_owner = *slab.get_callback_info(leaf_h);
+                        *slab.get_callback_info_mut(leaf_h) = owner;
 
                         println!("Insert {:x}", key);
 
@@ -932,7 +866,7 @@ mod tests {
                         } else {
                             let slab_min_h = slab.find_min().unwrap();
                             let slab_min = slab.leaf_nodes[slab_min_h as usize];
-                            let owner = Pubkey::new(slab.get_callback_info(slab_min_h));
+                            let owner = *slab.get_callback_info(slab_min_h);
                             let model_min = model.iter().next().unwrap().1;
                             assert_eq!(&(slab_min, owner), model_min);
                         }
@@ -943,7 +877,7 @@ mod tests {
                         } else {
                             let slab_max_h = slab.find_max().unwrap();
                             let slab_max = slab.leaf_nodes[slab_max_h as usize];
-                            let owner = Pubkey::new(slab.get_callback_info(slab_max_h));
+                            let owner = *slab.get_callback_info(slab_max_h);
                             let model_max = model.iter().next_back().unwrap().1;
                             assert_eq!(&(slab_max, owner), model_max);
                         }

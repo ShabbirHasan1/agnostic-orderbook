@@ -1,5 +1,7 @@
+#[cfg(feature = "benchmarking")]
 use bonfida_utils::{bench::BenchRunner, test_name};
 
+#[cfg(feature = "benchmarking")]
 pub fn main() {
     let samples = 10;
     let max_order_capacity = 100_000;
@@ -17,3 +19,6 @@ pub fn main() {
     }
     bench_runner.commit(order_capacities, compute_budget);
 }
+
+#[cfg(not(feature = "benchmarking"))]
+pub fn main() {}
